@@ -46,7 +46,8 @@ const PENDING_AGENT_RESUME_THEME_WAIT: Duration = Duration::from_millis(750);
 const SESSION_SAVE_DEBOUNCE: Duration = Duration::from_secs(5);
 const SIDEBAR_DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(350);
 const PANE_DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(350);
-const PANE_COPY_HIGHLIGHT_DURATION: Duration = Duration::from_millis(500);
+const PANE_WORD_COPY_HIGHLIGHT_DURATION: Duration = Duration::from_millis(500);
+const PANE_LINE_COPY_HIGHLIGHT_DURATION: Duration = Duration::from_secs(1);
 const COPY_FEEDBACK_DURATION: Duration = Duration::from_secs(2);
 
 use crossterm::{
@@ -80,16 +81,23 @@ pub(crate) struct OverlayPaneState {
     temp_files: Vec<std::path::PathBuf>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PaneClickCount {
+    One,
+    Two,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PaneClickState {
     pane_id: crate::layout::PaneId,
     viewport_row: u16,
     col: u16,
     at: Instant,
+    count: PaneClickCount,
 }
 
 impl PaneClickState {
-    fn is_double_click_for(self, next: Self) -> bool {
+    fn is_next_click_for(self, next: Self) -> bool {
         self.pane_id == next.pane_id
             && next.at.duration_since(self.at) <= PANE_DOUBLE_CLICK_WINDOW
             && self.viewport_row.abs_diff(next.viewport_row) <= 1
@@ -3094,6 +3102,7 @@ mod tests {
             viewport_row: 0,
             col: 0,
             at: selection_deadline,
+            count: PaneClickCount::One,
         });
         app.next_auto_update_check = Some(Instant::now());
         app.next_agent_manifest_update_check = Some(Instant::now());

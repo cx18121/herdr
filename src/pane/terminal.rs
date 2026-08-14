@@ -53,6 +53,14 @@ pub struct ScrollMetrics {
     pub viewport_rows: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TerminalLineRange {
+    pub start_row: u32,
+    pub start_col: u16,
+    pub end_row: u32,
+    pub end_col: u16,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct TerminalTextPoint {
     pub row: u32,
@@ -477,6 +485,10 @@ impl PaneTerminal {
 
     pub fn extract_selection(&self, selection: &crate::selection::Selection) -> Option<String> {
         self.ghostty.extract_selection(selection)
+    }
+
+    pub(crate) fn logical_line_range(&self, row: u32) -> Option<TerminalLineRange> {
+        self.ghostty.logical_line_range(row)
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect, show_cursor: bool) {
@@ -2065,6 +2077,14 @@ impl GhosttyPaneTerminal {
             .and_then(|mut core| ghostty_extract_selection(&mut core, selection).ok())
     }
 
+    pub(crate) fn logical_line_range(&self, row: u32) -> Option<TerminalLineRange> {
+        self.core
+            .lock()
+            .ok()
+            .and_then(|core| ghostty_logical_line_range(&core.terminal, row).ok())
+            .flatten()
+    }
+
     pub fn visible_hyperlinks(&self, area: Rect) -> Vec<((u16, u16), String, String)> {
         self.core
             .lock()
@@ -2762,6 +2782,62 @@ fn ghostty_extract_selection(
     let ((start_row, start_col), (end_row, end_col)) = selection.ordered_cells();
     core.terminal
         .read_text_screen((start_col, start_row), (end_col, end_row), false)
+}
+
+fn ghostty_logical_line_range(
+    terminal: &crate::ghostty::Terminal,
+    row: u32,
+) -> Result<Option<TerminalLineRange>, crate::ghostty::Error> {
+    let total_rows = terminal.total_rows()?;
+    let Some(target_row) = usize::try_from(row).ok().filter(|row| *row < total_rows) else {
+        return Ok(None);
+    };
+
+    let mut start_row = target_row;
+    while start_row > 0 {
+        let (_, wrap_continuation) = terminal.screen_row_wrap_state(start_row as u32)?;
+        if !wrap_continuation {
+            break;
+        }
+        start_row -= 1;
+    }
+
+    let mut end_row = target_row;
+    while end_row + 1 < total_rows {
+        let (soft_wrapped, _) = terminal.screen_row_wrap_state(end_row as u32)?;
+        if !soft_wrapped {
+            break;
+        }
+        end_row += 1;
+    }
+
+    let cols = terminal.cols()?;
+    let mut first_cell = None;
+    let mut last_cell = None;
+    for line_row in start_row..=end_row {
+        for col in 0..cols {
+            let (_, graphemes) = terminal.screen_cell(col, line_row as u32)?;
+            let has_text = graphemes.iter().copied().any(|codepoint| {
+                codepoint != crate::ghostty::KITTY_UNICODE_PLACEHOLDER
+                    && char::from_u32(codepoint).is_some_and(|ch| !ch.is_whitespace())
+            });
+            if has_text {
+                let cell = (line_row as u32, col);
+                first_cell.get_or_insert(cell);
+                last_cell = Some(cell);
+            }
+        }
+    }
+
+    let (Some((start_row, start_col)), Some((end_row, end_col))) = (first_cell, last_cell) else {
+        return Ok(None);
+    };
+    Ok(Some(TerminalLineRange {
+        start_row,
+        start_col,
+        end_row,
+        end_col,
+    }))
 }
 
 fn ghostty_screen_row(

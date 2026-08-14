@@ -481,6 +481,12 @@ mod tests {
         app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
     }
 
+    fn triple_click(app: &mut App, col: u16, row: u16) {
+        double_click(app, col, row);
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), col, row));
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    }
+
     fn modified_mouse(
         kind: MouseEventKind,
         col: u16,
@@ -699,6 +705,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn triple_click_selects_and_copies_logical_line() {
+        let (mut app, info) = app_with_screen_bytes(b"alpha beta-gamma");
+        let col = info.inner_rect.x + 8;
+        let row = info.inner_rect.y;
+        let clicked_at = std::time::Instant::now();
+        triple_click(&mut app, col, row);
+
+        assert_eq!(clipboard_write_content(&mut app), b"beta-gamma");
+        assert_eq!(clipboard_write_content(&mut app), b"alpha beta-gamma");
+        assert!(app
+            .selection_highlight_clear_deadline
+            .is_some_and(|deadline| deadline >= clicked_at + std::time::Duration::from_secs(1)));
+        assert_visible_selection(&app);
+        assert!(app.last_pane_click.is_none());
+    }
+
+    #[tokio::test]
+    async fn triple_click_trims_leading_and_trailing_whitespace() {
+        let (mut app, info) = app_with_screen_bytes(b"   alpha beta   ");
+        let col = info.inner_rect.x + 5;
+        let row = info.inner_rect.y;
+        triple_click(&mut app, col, row);
+
+        assert_eq!(clipboard_write_content(&mut app), b"alpha");
+        assert_eq!(clipboard_write_content(&mut app), b"alpha beta");
+        assert_eq!(
+            app.state
+                .selection
+                .as_ref()
+                .map(crate::selection::Selection::ordered_cells),
+            Some(((0, 3), (0, 12)))
+        );
+    }
+
+    #[tokio::test]
+    async fn triple_click_selects_across_soft_wrapped_rows() {
+        let mut app = app_for_mouse_test();
+        let mut ws = Workspace::test_new("test");
+        let pane_id = ws.tabs[0].root_pane;
+        let pane_infos = ws.tabs[0].layout.panes(Rect::new(26, 2, 20, 6));
+        let info = pane_infos[0].clone();
+        let line = "logical-line-continues-across-wrap";
+        ws.insert_test_runtime(
+            pane_id,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(
+                info.inner_rect.width,
+                info.inner_rect.height,
+                line.as_bytes(),
+            ),
+        );
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.view.pane_infos = pane_infos;
+
+        let col = info.inner_rect.x + 2;
+        let row = info.inner_rect.y + 1;
+        triple_click(&mut app, col, row);
+
+        let _ = clipboard_write_content(&mut app);
+        assert_eq!(clipboard_write_content(&mut app), line.as_bytes());
+        assert_eq!(
+            app.state
+                .selection
+                .as_ref()
+                .map(crate::selection::Selection::ordered_cells),
+            Some(((0, 0), (1, 13)))
+        );
+    }
+
+    #[tokio::test]
     async fn copy_on_select_disabled_keeps_drag_selection_without_copying() {
         let (mut app, info) = app_with_screen_bytes(b"alpha beta");
         app.state.copy_on_select = false;
@@ -738,6 +816,28 @@ mod tests {
         assert!(app.selection_autoscroll_deadline.is_none());
         assert!(app.selection_highlight_clear_deadline.is_none());
         assert!(app.event_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn copy_on_select_disabled_retains_triple_clicked_line_until_shortcut() {
+        let (mut app, info) = app_with_screen_bytes(b"alpha beta");
+        app.state.copy_on_select = false;
+        let col = info.inner_rect.x + 2;
+        let row = info.inner_rect.y;
+
+        triple_click(&mut app, col, row);
+
+        assert_visible_selection(&app);
+        assert!(app.selection_highlight_clear_deadline.is_none());
+        assert!(app.event_rx.try_recv().is_err());
+
+        app.handle_terminal_key_headless(TerminalKey::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        ));
+
+        assert_eq!(clipboard_write_content(&mut app), b"alpha beta");
+        assert!(app.state.selection.is_none());
     }
 
     #[tokio::test]

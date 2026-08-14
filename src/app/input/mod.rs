@@ -4,7 +4,7 @@ use bytes::Bytes;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use tracing::warn;
 
-use crate::app::PaneClickState;
+use crate::app::{PaneClickCount, PaneClickState};
 use crate::input::TerminalKey;
 #[cfg(test)]
 use ratatui::layout::Direction;
@@ -21,6 +21,13 @@ enum WheelRouting {
     HostScroll,
     MouseReport,
     AlternateScroll,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneClickGesture {
+    Single,
+    Double,
+    Triple,
 }
 
 const WORKSPACE_DRAG_THRESHOLD: u16 = 1;
@@ -384,14 +391,14 @@ impl App {
             return;
         }
 
-        let handled_pane_double_click = self.handle_pane_double_click(mouse);
-        if !handled_pane_double_click {
+        let handled_pane_click_gesture = self.handle_pane_click_gesture(mouse);
+        if !handled_pane_click_gesture {
             self.focus_pane_before_mouse_press(mouse);
         }
 
         let previous_agent_panel_sort = self.state.agent_panel_sort;
         let previous_settings_section = self.state.settings.section;
-        if !handled_pane_double_click {
+        if !handled_pane_click_gesture {
             if let Some(action) =
                 self.state
                     .handle_mouse(&mut self.terminal_runtimes, source_id, mouse)
@@ -621,20 +628,16 @@ impl App {
         true
     }
 
-    fn handle_pane_double_click(&mut self, mouse: MouseEvent) -> bool {
-        // A pane press stops being a double-click candidate once it becomes
-        // a drag or completes as a real text selection.
+    fn handle_pane_click_gesture(&mut self, mouse: MouseEvent) -> bool {
         match mouse.kind {
             MouseEventKind::Drag(MouseButton::Left) => {
                 self.last_pane_click = None;
                 return false;
             }
             MouseEventKind::Up(MouseButton::Left)
-                if self
-                    .state
-                    .selection
-                    .as_ref()
-                    .is_some_and(|selection| selection.is_visible()) =>
+                if self.state.selection.as_ref().is_some_and(|selection| {
+                    selection.is_visible() && !selection.is_finalized()
+                }) =>
             {
                 self.last_pane_click = None;
                 return false;
@@ -642,19 +645,15 @@ impl App {
             _ => {}
         }
 
-        // Only terminal-pane left-clicks can start this gesture; other clicks
-        // should keep their existing mouse behavior and clear stale candidates.
         let Some(click) = self.pane_click_candidate(mouse) else {
             return false;
         };
 
-        // Require the second click to land near the first click in the same pane
-        // and within the double-click window so adjacent interactions do not select a word.
-        if !self.take_pane_double_click(click) {
-            return false;
+        match self.take_pane_click(click) {
+            PaneClickGesture::Single => false,
+            PaneClickGesture::Double => self.select_double_clicked_word(click),
+            PaneClickGesture::Triple => self.select_triple_clicked_line(click),
         }
-
-        self.select_double_clicked_word(click)
     }
 
     fn pane_click_candidate(&mut self, mouse: MouseEvent) -> Option<PaneClickState> {
@@ -682,20 +681,30 @@ impl App {
             viewport_row: mouse.row - info.inner_rect.y,
             col: mouse.column - info.inner_rect.x,
             at: std::time::Instant::now(),
+            count: PaneClickCount::One,
         })
     }
 
-    fn take_pane_double_click(&mut self, click: PaneClickState) -> bool {
-        if !self
-            .last_pane_click
-            .is_some_and(|last| last.is_double_click_for(click))
-        {
+    fn take_pane_click(&mut self, click: PaneClickState) -> PaneClickGesture {
+        let Some(last) = self.last_pane_click.take() else {
             self.last_pane_click = Some(click);
-            return false;
+            return PaneClickGesture::Single;
+        };
+        if !last.is_next_click_for(click) {
+            self.last_pane_click = Some(click);
+            return PaneClickGesture::Single;
         }
 
-        self.last_pane_click = None;
-        true
+        match last.count {
+            PaneClickCount::One => {
+                self.last_pane_click = Some(PaneClickState {
+                    count: PaneClickCount::Two,
+                    ..click
+                });
+                PaneClickGesture::Double
+            }
+            PaneClickCount::Two => PaneClickGesture::Triple,
+        }
     }
 
     fn select_double_clicked_word(&mut self, click: PaneClickState) -> bool {
@@ -705,13 +714,38 @@ impl App {
             click.viewport_row,
             click.col,
         );
+        self.update_pane_click_highlight_deadline(
+            selected,
+            super::PANE_WORD_COPY_HIGHLIGHT_DURATION,
+        );
+        selected
+    }
+
+    fn select_triple_clicked_line(&mut self, click: PaneClickState) -> bool {
+        let selected = self.state.select_line_at_pane_cell(
+            &self.terminal_runtimes,
+            click.pane_id,
+            click.viewport_row,
+            click.col,
+        );
+        self.update_pane_click_highlight_deadline(
+            selected,
+            super::PANE_LINE_COPY_HIGHLIGHT_DURATION,
+        );
+        selected
+    }
+
+    fn update_pane_click_highlight_deadline(
+        &mut self,
+        selected: bool,
+        duration: std::time::Duration,
+    ) {
         if selected {
             self.selection_highlight_clear_deadline = self
                 .state
                 .copy_on_select
-                .then(|| std::time::Instant::now() + super::PANE_COPY_HIGHLIGHT_DURATION);
+                .then(|| std::time::Instant::now() + duration);
         }
-        selected
     }
 }
 

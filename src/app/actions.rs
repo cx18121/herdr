@@ -2229,6 +2229,73 @@ impl AppState {
         true
     }
 
+    pub(crate) fn select_line_at_pane_cell(
+        &mut self,
+        terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry,
+        pane_id: crate::layout::PaneId,
+        viewport_row: u16,
+        col: u16,
+    ) -> bool {
+        let Some(ws_idx) = self
+            .active
+            .filter(|idx| self.workspaces.get(*idx).is_some())
+        else {
+            return false;
+        };
+
+        let Some(info) = self.pane_info_by_id(pane_id) else {
+            return false;
+        };
+        if viewport_row >= info.inner_rect.height || col >= info.inner_rect.width {
+            return false;
+        }
+
+        let Some(rt) = self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id)
+        else {
+            return false;
+        };
+        if rt.mouse_reporting_enabled() {
+            return false;
+        }
+
+        let metrics = self.pane_scroll_metrics(terminal_runtimes, pane_id);
+        let row = Selection::absolute_row_for_viewport(viewport_row, metrics);
+        let Some(range) = rt.logical_line_range(row) else {
+            return false;
+        };
+        let mut selection = Selection::terminal_range(
+            pane_id,
+            range.start_row,
+            range.start_col,
+            range.end_row,
+            range.end_col,
+        );
+        if !selection.finish() {
+            return false;
+        }
+
+        let text = if self.copy_on_select {
+            let Some(text) = rt
+                .extract_selection(&selection)
+                .filter(|text| !text.is_empty())
+            else {
+                self.clear_selection();
+                return false;
+            };
+            Some(text)
+        } else {
+            None
+        };
+
+        self.selection = Some(selection);
+        self.selection_autoscroll = None;
+        if let Some(text) = text {
+            self.request_clipboard_write = Some(text.into_bytes());
+            info!("copied triple-clicked line to clipboard");
+        }
+        true
+    }
+
     pub(crate) fn url_at_pane_cell(
         &self,
         terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry,

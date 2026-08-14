@@ -97,6 +97,21 @@ impl Selection {
         }
     }
 
+    pub(crate) fn terminal_range(
+        pane_id: PaneId,
+        start_row: u32,
+        start_col: u16,
+        end_row: u32,
+        end_col: u16,
+    ) -> Self {
+        Self {
+            pane_id,
+            anchor: (start_row, start_col),
+            cursor: (end_row, end_col),
+            phase: Phase::Dragging,
+        }
+    }
+
     pub(crate) fn absolute_row_for_viewport(
         viewport_row: u16,
         metrics: Option<ScrollMetrics>,

@@ -416,6 +416,10 @@ impl TerminalRuntime {
         self.0.extract_selection(selection)
     }
 
+    pub(crate) fn logical_line_range(&self, row: u32) -> Option<crate::pane::TerminalLineRange> {
+        self.0.logical_line_range(row)
+    }
+
     pub fn render(&self, frame: &mut Frame, area: Rect, show_cursor: bool) {
         self.0.render(frame, area, show_cursor);
     }

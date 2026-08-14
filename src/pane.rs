@@ -44,8 +44,8 @@ use self::agent_detection::{
 pub use self::terminal::InputState;
 use self::terminal::{GhosttyPaneTerminal, PaneTerminal};
 pub(crate) use self::terminal::{
-    TerminalDirtyPatch, TerminalDirtyPatchOutcome, TerminalReadSnapshot, TerminalTextMatch,
-    TerminalTextPoint, TerminalWordMotion,
+    TerminalDirtyPatch, TerminalDirtyPatchOutcome, TerminalLineRange, TerminalReadSnapshot,
+    TerminalTextMatch, TerminalTextPoint, TerminalWordMotion,
 };
 pub use self::{
     state::PaneState,
@@ -2793,6 +2793,10 @@ impl PaneRuntime {
 
     pub fn extract_selection(&self, selection: &crate::selection::Selection) -> Option<String> {
         self.terminal.extract_selection(selection)
+    }
+
+    pub(crate) fn logical_line_range(&self, row: u32) -> Option<TerminalLineRange> {
+        self.terminal.logical_line_range(row)
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect, show_cursor: bool) {
