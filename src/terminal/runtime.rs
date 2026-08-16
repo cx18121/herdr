@@ -446,6 +446,10 @@ impl TerminalRuntime {
         self.0.kitty_image_placements_with_data_filter(needs_data)
     }
 
+    pub fn has_kitty_graphics_state(&self) -> bool {
+        self.0.has_kitty_graphics_state()
+    }
+
     pub fn keyboard_protocol(&self) -> crate::input::KeyboardProtocol {
         self.0.keyboard_protocol()
     }

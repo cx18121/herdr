@@ -2264,6 +2264,21 @@
             }
           ]
         },
+        "LayoutRearrangeParams": {
+          "properties": {
+            "root": {
+              "$ref": "#/schemas/request/$defs/LayoutNode"
+            },
+            "tab_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "tab_id",
+            "root"
+          ],
+          "type": "object"
+        },
         "LayoutSetSplitRatioParams": {
           "properties": {
             "pane_id": {
@@ -5233,6 +5248,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/LayoutApplyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "layout.rearrange",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/LayoutRearrangeParams"
             }
           },
           "required": [
@@ -9163,6 +9194,22 @@
                 },
                 "type": {
                   "const": "layout_apply",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "layout"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "layout": {
+                  "$ref": "#/schemas/success_response/$defs/LayoutDescription"
+                },
+                "type": {
+                  "const": "layout_rearrange",
                   "type": "string"
                 }
               },

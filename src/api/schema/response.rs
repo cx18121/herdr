@@ -144,6 +144,9 @@ pub enum ResponseResult {
     LayoutApply {
         layout: LayoutDescription,
     },
+    LayoutRearrange {
+        layout: LayoutDescription,
+    },
     LayoutSplitRatioSet {
         layout: LayoutDescription,
     },

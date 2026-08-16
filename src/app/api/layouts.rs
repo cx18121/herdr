@@ -4,7 +4,8 @@ use ratatui::layout::Direction;
 
 use crate::api::schema::{
     EventData, EventEnvelope, EventKind, LayoutApplyParams, LayoutDescription, LayoutExportParams,
-    LayoutNode, LayoutPane, LayoutSetSplitRatioParams, ResponseResult, SplitDirection,
+    LayoutNode, LayoutPane, LayoutRearrangeParams, LayoutSetSplitRatioParams, ResponseResult,
+    SplitDirection,
 };
 use crate::app::{App, Mode};
 use crate::layout::{Node, PaneId};
@@ -216,6 +217,104 @@ impl App {
             return encode_error(id, "layout_apply_failed", "new layout unavailable");
         };
         encode_success(id, ResponseResult::LayoutApply { layout })
+    }
+
+    pub(super) fn handle_layout_rearrange(
+        &mut self,
+        id: String,
+        params: LayoutRearrangeParams,
+    ) -> String {
+        let Some((ws_idx, tab_idx)) = self.parse_tab_id(&params.tab_id) else {
+            return encode_error(
+                id,
+                "tab_not_found",
+                format!("tab {} not found", params.tab_id),
+            );
+        };
+        if let Err(message) = validate_layout_tree(&params.root) {
+            return encode_error(id, "invalid_layout", message);
+        }
+        let root = match self.existing_layout_node(ws_idx, tab_idx, &params.root) {
+            Ok(root) => root,
+            Err(message) => return encode_error(id, "invalid_layout", message),
+        };
+        let replaced = self
+            .state
+            .workspaces
+            .get_mut(ws_idx)
+            .and_then(|workspace| workspace.tabs.get_mut(tab_idx))
+            .is_some_and(|tab| tab.layout.replace_root_with_same_panes(root));
+        if !replaced {
+            return encode_error(
+                id,
+                "invalid_layout",
+                "layout must contain every pane in the target tab exactly once",
+            );
+        }
+
+        self.schedule_session_save();
+        let visible = self.state.active == Some(ws_idx)
+            && self.state.workspaces[ws_idx].active_tab_index() == tab_idx;
+        if visible {
+            self.request_topology_frame_first();
+        }
+        let Some(layout) = self.layout_description(ws_idx, tab_idx) else {
+            return encode_error(id, "layout_not_found", "layout unavailable");
+        };
+        self.emit_layout_updated_event(ws_idx, tab_idx);
+        encode_success(id, ResponseResult::LayoutRearrange { layout })
+    }
+
+    fn existing_layout_node(
+        &self,
+        ws_idx: usize,
+        tab_idx: usize,
+        node: &LayoutNode,
+    ) -> Result<Node, String> {
+        match node {
+            LayoutNode::Pane { pane } => {
+                if pane.label.is_some()
+                    || pane.cwd.is_some()
+                    || pane.command.is_some()
+                    || !pane.env.is_empty()
+                {
+                    return Err(
+                        "rearranged pane leaves may contain only an existing pane_id".into(),
+                    );
+                }
+                let pane_id = pane.pane_id.as_deref().ok_or_else(|| {
+                    "rearranged pane leaves require an existing pane_id".to_string()
+                })?;
+                let Some((pane_ws_idx, internal_id)) = self.parse_pane_id(pane_id) else {
+                    return Err(format!("pane {pane_id} not found"));
+                };
+                let belongs_to_tab = pane_ws_idx == ws_idx
+                    && self
+                        .state
+                        .workspaces
+                        .get(ws_idx)
+                        .and_then(|workspace| workspace.tabs.get(tab_idx))
+                        .is_some_and(|tab| tab.layout.pane_ids().contains(&internal_id));
+                if !belongs_to_tab {
+                    return Err(format!("pane {pane_id} does not belong to the target tab"));
+                }
+                Ok(Node::Pane(internal_id))
+            }
+            LayoutNode::Split {
+                direction,
+                ratio,
+                first,
+                second,
+            } => Ok(Node::Split {
+                direction: match direction {
+                    SplitDirection::Right => Direction::Horizontal,
+                    SplitDirection::Down => Direction::Vertical,
+                },
+                ratio: *ratio,
+                first: Box::new(self.existing_layout_node(ws_idx, tab_idx, first)?),
+                second: Box::new(self.existing_layout_node(ws_idx, tab_idx, second)?),
+            }),
+        }
     }
 
     pub(super) fn handle_layout_set_split_ratio(
@@ -672,6 +771,137 @@ mod tests {
         };
         assert_eq!(pane.label.as_deref(), Some("tests"));
         assert_eq!(pane.pane_id, Some(app.public_pane_id(0, right).unwrap()));
+    }
+
+    fn existing_pane(pane_id: String) -> LayoutNode {
+        LayoutNode::Pane {
+            pane: LayoutPane {
+                pane_id: Some(pane_id),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn layout_rearrange_replaces_only_tree_shape_and_emits_one_layout_event() {
+        let mut app = app_with_workspace();
+        let first = app.state.workspaces[0].tabs[0].root_pane;
+        let second = app.state.workspaces[0].test_split(Direction::Horizontal);
+        app.state.ensure_test_terminals();
+        app.state.workspaces[0].tabs[0].layout.focus_pane(first);
+        app.state.workspaces[0].tabs[0].zoomed = true;
+        let tab_id = app.public_tab_id(0, 0).unwrap();
+        let first_public = app.public_pane_id(0, first).unwrap();
+        let second_public = app.public_pane_id(0, second).unwrap();
+        let first_terminal = app.state.workspaces[0].tabs[0]
+            .terminal_id(first)
+            .cloned()
+            .unwrap();
+        let second_terminal = app.state.workspaces[0].tabs[0]
+            .terminal_id(second)
+            .cloned()
+            .unwrap();
+
+        let response = app.handle_layout_rearrange(
+            "req".into(),
+            LayoutRearrangeParams {
+                tab_id: tab_id.clone(),
+                root: LayoutNode::Split {
+                    direction: SplitDirection::Down,
+                    ratio: 0.4,
+                    first: Box::new(existing_pane(second_public.clone())),
+                    second: Box::new(existing_pane(first_public.clone())),
+                },
+            },
+        );
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::LayoutRearrange { layout } = success.result else {
+            panic!("expected layout rearrange response");
+        };
+        assert_eq!(layout.tab_id, tab_id);
+        assert!(layout.zoomed);
+        assert_eq!(layout.focused_pane_id, first_public);
+        assert_eq!(app.state.workspaces[0].tabs.len(), 1);
+        assert_eq!(
+            app.state.workspaces[0].tabs[0].terminal_id(first),
+            Some(&first_terminal)
+        );
+        assert_eq!(
+            app.state.workspaces[0].tabs[0].terminal_id(second),
+            Some(&second_terminal)
+        );
+        assert_eq!(
+            app.state.workspaces[0].tabs[0].layout.pane_ids(),
+            vec![second, first]
+        );
+        assert_eq!(
+            app.event_hub
+                .events_after(0)
+                .into_iter()
+                .map(|(_, event)| event.event)
+                .collect::<Vec<_>>(),
+            vec![EventKind::LayoutUpdated]
+        );
+        app.state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn layout_rearrange_rejects_duplicate_missing_foreign_and_metadata_leaves() {
+        let mut app = app_with_workspace();
+        let first = app.state.workspaces[0].tabs[0].root_pane;
+        let second = app.state.workspaces[0].test_split(Direction::Horizontal);
+        let foreign_tab = app.state.workspaces[0].test_add_tab(Some("foreign"));
+        let foreign = app.state.workspaces[0].tabs[foreign_tab].root_pane;
+        app.state.ensure_test_terminals();
+        let tab_id = app.public_tab_id(0, 0).unwrap();
+        let first_public = app.public_pane_id(0, first).unwrap();
+        let second_public = app.public_pane_id(0, second).unwrap();
+        let foreign_public = app.public_pane_id(0, foreign).unwrap();
+        let before = app.state.workspaces[0].tabs[0].layout.pane_ids();
+
+        let invalid_roots = [
+            LayoutNode::Split {
+                direction: SplitDirection::Right,
+                ratio: 0.5,
+                first: Box::new(existing_pane(first_public.clone())),
+                second: Box::new(existing_pane(first_public.clone())),
+            },
+            existing_pane(first_public.clone()),
+            LayoutNode::Split {
+                direction: SplitDirection::Right,
+                ratio: 0.5,
+                first: Box::new(existing_pane(first_public.clone())),
+                second: Box::new(existing_pane(foreign_public)),
+            },
+            LayoutNode::Split {
+                direction: SplitDirection::Right,
+                ratio: 0.5,
+                first: Box::new(LayoutNode::Pane {
+                    pane: LayoutPane {
+                        pane_id: Some(first_public),
+                        label: Some("changed".into()),
+                        ..Default::default()
+                    },
+                }),
+                second: Box::new(existing_pane(second_public)),
+            },
+        ];
+
+        for root in invalid_roots {
+            let response = app.handle_layout_rearrange(
+                "req".into(),
+                LayoutRearrangeParams {
+                    tab_id: tab_id.clone(),
+                    root,
+                },
+            );
+            let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+            assert_eq!(error.error.code, "invalid_layout");
+            assert_eq!(app.state.workspaces[0].tabs[0].layout.pane_ids(), before);
+        }
+        assert!(app.event_hub.events_after(0).is_empty());
+        app.state.assert_invariants_for_test();
     }
 
     #[test]

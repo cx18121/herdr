@@ -1,6 +1,7 @@
 //! BSP tree layout for tiling panes within a workspace.
 
 use std::cmp::Reverse;
+use std::collections::HashSet;
 
 use ratatui::{
     layout::{Direction, Rect},
@@ -328,6 +329,25 @@ impl TileLayout {
         ids
     }
 
+    /// Atomically replace only the tree shape when the proposed root contains
+    /// every existing pane exactly once. Focus and focus history are preserved.
+    pub fn replace_root_with_same_panes(&mut self, mut root: Node) -> bool {
+        let current: HashSet<PaneId> = self.pane_ids().into_iter().collect();
+        let mut proposed_ids = Vec::new();
+        collect_ids(&root, &mut proposed_ids);
+        let proposed: HashSet<PaneId> = proposed_ids.iter().copied().collect();
+        if proposed_ids.len() != current.len()
+            || proposed.len() != proposed_ids.len()
+            || proposed != current
+        {
+            return false;
+        }
+
+        normalize_split_ratios(&mut root);
+        self.root = root;
+        true
+    }
+
     /// Access the tree root for serialization.
     pub fn root(&self) -> &Node {
         &self.root
@@ -616,6 +636,20 @@ fn split_at(
     }
 }
 
+fn normalize_split_ratios(node: &mut Node) {
+    if let Node::Split {
+        ratio,
+        first,
+        second,
+        ..
+    } = node
+    {
+        *ratio = valid_split_ratio(*ratio);
+        normalize_split_ratios(first);
+        normalize_split_ratios(second);
+    }
+}
+
 fn valid_split_ratio(ratio: f32) -> f32 {
     if ratio.is_finite() {
         ratio.clamp(0.1, 0.9)
@@ -809,6 +843,61 @@ mod tests {
         assert_eq!(pane_rects(&layout), before_rects);
         assert_eq!(split_snapshot(&layout), before_splits);
         assert_eq!(layout.focused(), before_focus);
+    }
+
+    #[test]
+    fn replace_root_with_same_panes_is_atomic_and_preserves_focus_history() {
+        let mut layout = sample_layout();
+        layout.focus_pane(pane(3));
+        layout.focus_pane(pane(2));
+        let replacement = Node::Split {
+            direction: Direction::Vertical,
+            ratio: 0.5,
+            first: Box::new(Node::Split {
+                direction: Direction::Horizontal,
+                ratio: 0.5,
+                first: Box::new(Node::Pane(pane(4))),
+                second: Box::new(Node::Pane(pane(2))),
+            }),
+            second: Box::new(Node::Split {
+                direction: Direction::Horizontal,
+                ratio: 0.5,
+                first: Box::new(Node::Pane(pane(1))),
+                second: Box::new(Node::Pane(pane(3))),
+            }),
+        };
+
+        assert!(layout.replace_root_with_same_panes(replacement));
+        assert_eq!(layout.pane_ids(), vec![pane(4), pane(2), pane(1), pane(3)]);
+        assert_eq!(layout.focused(), pane(2));
+        assert!(layout.close_focused());
+        assert_eq!(layout.focused(), pane(3));
+    }
+
+    #[test]
+    fn replace_root_with_same_panes_rejects_duplicate_or_missing_ids_without_mutation() {
+        let mut layout = sample_layout();
+        let before = pane_rects(&layout);
+        let invalid = Node::Split {
+            direction: Direction::Horizontal,
+            ratio: 0.5,
+            first: Box::new(Node::Pane(pane(1))),
+            second: Box::new(Node::Split {
+                direction: Direction::Vertical,
+                ratio: 0.5,
+                first: Box::new(Node::Pane(pane(2))),
+                second: Box::new(Node::Split {
+                    direction: Direction::Horizontal,
+                    ratio: 0.5,
+                    first: Box::new(Node::Pane(pane(2))),
+                    second: Box::new(Node::Pane(pane(4))),
+                }),
+            }),
+        };
+
+        assert!(!layout.replace_root_with_same_panes(invalid));
+        assert_eq!(pane_rects(&layout), before);
+        assert_eq!(layout.focused(), pane(2));
     }
 
     #[test]

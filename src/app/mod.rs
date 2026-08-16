@@ -105,6 +105,55 @@ impl PaneClickState {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum TopologyRenderPhase {
+    #[default]
+    Idle,
+    PreviewPending,
+    ResizePending,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TopologyRenderPlan {
+    PreviewWithoutResize,
+    Resize,
+    ResizeTopology,
+    ResizeAfterPreview,
+}
+
+impl TopologyRenderPhase {
+    fn request(&mut self) {
+        if *self == Self::Idle {
+            *self = Self::PreviewPending;
+        }
+    }
+
+    pub(crate) fn preview_requested(self) -> bool {
+        self == Self::PreviewPending
+    }
+
+    pub(crate) fn next(&mut self, preview_safe: bool) -> TopologyRenderPlan {
+        match (*self, preview_safe) {
+            (Self::PreviewPending, true) => {
+                *self = Self::ResizePending;
+                TopologyRenderPlan::PreviewWithoutResize
+            }
+            (Self::PreviewPending, false) => {
+                *self = Self::Idle;
+                TopologyRenderPlan::ResizeTopology
+            }
+            (Self::ResizePending, _) => {
+                *self = Self::Idle;
+                TopologyRenderPlan::ResizeAfterPreview
+            }
+            _ => {
+                *self = Self::Idle;
+                TopologyRenderPlan::Resize
+            }
+        }
+    }
+}
+
 pub struct App {
     pub state: AppState,
     pub(crate) pane_graphics: pane_graphics::Runtime,
@@ -165,6 +214,7 @@ pub struct App {
     pub render_notify: Arc<Notify>,
     pub(crate) render_dirty: Arc<crate::render_signal::RenderSignal>,
     pub(crate) full_redraw_pending: bool,
+    pub(crate) topology_render_phase: TopologyRenderPhase,
     pub(crate) overlay_panes: HashMap<crate::layout::PaneId, OverlayPaneState>,
     pub(crate) local_terminal_notifications: bool,
     /// Whether this process applies `AppEvent::PrefixInputSource` to the host input source.
@@ -822,6 +872,7 @@ impl App {
             render_notify,
             render_dirty,
             full_redraw_pending: false,
+            topology_render_phase: TopologyRenderPhase::Idle,
             overlay_panes: HashMap::new(),
             local_terminal_notifications: true,
             local_input_source_switch: true,
@@ -916,6 +967,10 @@ impl App {
 
     fn request_repaint(&mut self) {
         self.full_redraw_pending = true;
+    }
+
+    pub(crate) fn request_topology_frame_first(&mut self) {
+        self.topology_render_phase.request();
     }
 
     pub(crate) fn sync_prefix_input_source(&mut self, previous_mode: Mode) {
@@ -1111,6 +1166,7 @@ impl App {
                     }
                 }
                 let _sync_output = SyncOutputGuard::begin()?;
+                self.topology_render_phase.next(false);
                 let kitty_graphics_enabled = self.state.kitty_graphics_enabled;
                 if self.full_redraw_pending {
                     for cell in &mut terminal.current_buffer_mut().content {
@@ -2011,6 +2067,25 @@ mod tests {
         crate::raw_input::RawInputEvent::Key(
             crate::input::TerminalKey::new(code, modifiers).with_kind(kind),
         )
+    }
+
+    #[test]
+    fn topology_render_phase_schedules_one_preview_and_guaranteed_resize() {
+        let mut phase = TopologyRenderPhase::default();
+        phase.request();
+        phase.request();
+        assert_eq!(phase.next(true), TopologyRenderPlan::PreviewWithoutResize);
+        phase.request();
+        assert_eq!(phase.next(true), TopologyRenderPlan::ResizeAfterPreview);
+        assert_eq!(phase, TopologyRenderPhase::Idle);
+    }
+
+    #[test]
+    fn topology_render_phase_skips_preview_when_unsafe() {
+        let mut phase = TopologyRenderPhase::default();
+        phase.request();
+        assert_eq!(phase.next(false), TopologyRenderPlan::ResizeTopology);
+        assert_eq!(phase, TopologyRenderPhase::Idle);
     }
 
     #[cfg(windows)]

@@ -2826,6 +2826,10 @@ impl PaneRuntime {
             .kitty_image_placements_with_data_filter(needs_data)
     }
 
+    pub fn has_kitty_graphics_state(&self) -> bool {
+        self.terminal.has_kitty_graphics_state()
+    }
+
     pub fn keyboard_protocol(&self) -> crate::input::KeyboardProtocol {
         let fallback = crate::input::KeyboardProtocol::from_kitty_flags(
             self.kitty_keyboard_flags.load(Ordering::Relaxed),

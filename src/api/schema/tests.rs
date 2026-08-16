@@ -1049,6 +1049,23 @@ fn layout_export_apply_round_trip() {
     let restored: Request = serde_json::from_str(&json).unwrap();
     assert_eq!(restored, apply);
 
+    let rearrange = Request {
+        id: "layout_rearrange".into(),
+        method: Method::LayoutRearrange(LayoutRearrangeParams {
+            tab_id: "w1:1".into(),
+            root: LayoutNode::Pane {
+                pane: LayoutPane {
+                    pane_id: Some("w1-1".into()),
+                    ..Default::default()
+                },
+            },
+        }),
+    };
+    let json = serde_json::to_string(&rearrange).unwrap();
+    assert!(json.contains("\"method\":\"layout.rearrange\""));
+    let restored: Request = serde_json::from_str(&json).unwrap();
+    assert_eq!(restored, rearrange);
+
     let response = SuccessResponse {
         id: "layout_export".into(),
         result: ResponseResult::LayoutExport {

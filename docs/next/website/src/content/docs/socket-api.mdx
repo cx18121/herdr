@@ -105,7 +105,7 @@ Raw socket method names use dot notation:
 | Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.move`, `tab.close` |
 | Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.read`, `pane.graphics.info`, `pane.graphics.set`, `pane.graphics.clear`, `pane.graphics.stream`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
 | Popup | `popup.close` |
-| Layout | `layout.export`, `layout.apply`, `layout.set_split_ratio` |
+| Layout | `layout.export`, `layout.apply`, `layout.rearrange`, `layout.set_split_ratio` |
 | Agent | `agent.list`, `agent.get`, `agent.read`, `agent.explain`, `agent.send_keys`, `agent.prompt`, `agent.wait`, `agent.rename`, `agent.focus`, `agent.start`, `agent.view.set`, `agent.view.clear` |
 | Events | `events.subscribe`, `events.wait` |
 | Integrations | `integration.install`, `integration.uninstall` |
@@ -288,6 +288,16 @@ not preserve live PTYs, scrollback, or running processes.
     }
   }
 }
+```
+
+`layout.rearrange` atomically changes the split tree of an existing tab without
+replacing its panes. Every pane leaf must contain only a `pane_id`, and the tree
+must contain every pane in the target tab exactly once. Tab identity, focus,
+processes, terminal runtimes, and scrollback are preserved. The operation emits
+one `layout.updated` event and returns the resulting layout.
+
+```json
+{"id":"req_rearrange","method":"layout.rearrange","params":{"tab_id":"w1:t1","root":{"type":"split","direction":"down","ratio":0.5,"first":{"type":"pane","pane_id":"w1:p2"},"second":{"type":"pane","pane_id":"w1:p1"}}}}
 ```
 
 `layout.set_split_ratio` updates an existing split in a tab layout. The response

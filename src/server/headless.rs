@@ -788,14 +788,29 @@ impl HeadlessServer {
                     needs_render = false;
                     continue;
                 }
+                let mut topology_followup = false;
                 if !rendered_retained {
                     crate::render_prof::event("full_render.invoke");
-                    self.render_and_stream();
+                    let preview_safe = !self.app.topology_render_phase.preview_requested()
+                        || self.topology_preview_safe();
+                    let topology_plan = self.app.topology_render_phase.next(preview_safe);
+                    topology_followup =
+                        matches!(topology_plan, app::TopologyRenderPlan::PreviewWithoutResize);
+                    let resize_panes =
+                        !matches!(topology_plan, app::TopologyRenderPlan::PreviewWithoutResize);
+                    self.render_and_stream_with_pane_resize(
+                        resize_panes,
+                        matches!(
+                            topology_plan,
+                            app::TopologyRenderPlan::ResizeTopology
+                                | app::TopologyRenderPlan::ResizeAfterPreview
+                        ),
+                    );
                 }
                 self.app
                     .record_render_attempt(now, render_plan != RetainedRenderPlan::HiddenPty);
-                needs_render = false;
-                needs_full_render = false;
+                needs_render = topology_followup;
+                needs_full_render = topology_followup;
                 needs_graphics_render = false;
                 continue;
             }
@@ -4429,14 +4444,69 @@ impl HeadlessServer {
         }
     }
 
+    fn topology_preview_safe(&self) -> bool {
+        if self.app.state.kitty_graphics_enabled {
+            if !self.app.pane_graphics.slots.is_empty() {
+                return false;
+            }
+            if let Some(ws_idx) = self.app.state.active {
+                let has_terminal_graphics = self.app.state.workspaces[ws_idx]
+                    .layout
+                    .pane_ids()
+                    .into_iter()
+                    .any(|pane_id| {
+                        self.app
+                            .state
+                            .runtime_for_pane_in_workspace(
+                                &self.app.terminal_runtimes,
+                                ws_idx,
+                                pane_id,
+                            )
+                            .is_some_and(|runtime| runtime.has_kitty_graphics_state())
+                    });
+                if has_terminal_graphics {
+                    return false;
+                }
+            }
+        }
+
+        let targets = render_targets(&self.clients, self.foreground_client_id);
+        let mut has_foreground_app_target = false;
+        for (client_id, _, _, is_foreground, mode) in targets {
+            if !matches!(mode, ClientConnectionMode::App) {
+                continue;
+            }
+            has_foreground_app_target |= is_foreground;
+            if self.app.state.kitty_graphics_enabled
+                && self
+                    .clients
+                    .get(&client_id)
+                    .is_some_and(|client| !client.graphics_cache.is_empty())
+            {
+                return false;
+            }
+        }
+        has_foreground_app_target
+    }
+
+    #[cfg(test)]
     fn render_and_stream(&mut self) {
+        self.render_and_stream_with_pane_resize(true, false);
+    }
+
+    fn render_and_stream_with_pane_resize(
+        &mut self,
+        resize_panes: bool,
+        force_post_resize_fanout: bool,
+    ) {
         let full_started = crate::render_prof::timer();
         let render_targets = render_targets(&self.clients, self.foreground_client_id);
 
         if render_targets.is_empty() {
             let (cols, rows) = self.effective_size;
             let area = Rect::new(0, 0, cols, rows);
-            let resize_panes = self.app.state.view.pane_infos.is_empty();
+            let resize_panes = resize_panes
+                && (force_post_resize_fanout || self.app.state.view.pane_infos.is_empty());
             let render_started = crate::render_prof::timer();
             let _ = crate::server::render_stream::render_virtual_with_runtime_registry(
                 &mut self.app.state,
@@ -4453,6 +4523,40 @@ impl HeadlessServer {
                 rows, resize_panes, "rendered virtual frame with no attached clients"
             );
             return;
+        }
+
+        // A topology follow-up must resize before any client frame is built.
+        // Otherwise background clients rendered before the foreground resize can
+        // retain a frame based on the old terminal grid indefinitely.
+        let mut resize_during_fanout = resize_panes;
+        if resize_panes && force_post_resize_fanout {
+            if let Some((_, (cols, rows), cell_size, _, _)) =
+                render_targets
+                    .iter()
+                    .find(|(_, _, _, is_foreground, mode)| {
+                        *is_foreground && matches!(mode, ClientConnectionMode::App)
+                    })
+            {
+                let area = Rect::new(0, 0, *cols, *rows);
+                let render_cell_size =
+                    if self.app.state.kitty_graphics_enabled && cell_size.is_known() {
+                        *cell_size
+                    } else {
+                        crate::kitty_graphics::HostCellSize::default()
+                    };
+                let resize_started = crate::render_prof::timer();
+                crate::ui::compute_view_with_cell_size(
+                    &mut self.app.state,
+                    &self.app.terminal_runtimes,
+                    area,
+                    render_cell_size,
+                );
+                crate::render_prof::duration_since(
+                    "full_render.topology_pre_resize_compute",
+                    resize_started,
+                );
+                resize_during_fanout = false;
+            }
         }
 
         let mut broken_clients: Vec<u64> = Vec::new();
@@ -4480,7 +4584,7 @@ impl HeadlessServer {
                             &mut self.app.state,
                             &self.app.terminal_runtimes,
                             area,
-                            is_foreground,
+                            is_foreground && resize_during_fanout,
                             render_cell_size,
                         );
                     if let Some((workspace, agent_panel, tab, mobile_switcher)) = preserved_scroll {
@@ -10301,6 +10405,232 @@ next_tab = ""
                 .expect("retained frame after safe mode"),
         );
         assert!(patched.cells.iter().any(|cell| cell.symbol == "Z"));
+    }
+
+    #[tokio::test]
+    async fn topology_preview_is_skipped_for_any_live_graphics_state() {
+        let (mut server, _client_rx, pane_id) = retained_test_server(b"graphics");
+        assert!(server.topology_preview_safe());
+
+        server.app.state.kitty_graphics_enabled = true;
+        server.app.pane_graphics.slots.insert(
+            (pane_id, "primary".into()),
+            crate::app::pane_graphics::Slot::test(1, None),
+        );
+
+        assert!(!server.topology_preview_safe());
+    }
+
+    #[tokio::test]
+    async fn topology_preview_is_skipped_for_terminal_native_graphics_state() {
+        let (mut server, _client_rx, pane_id) = retained_test_server(b"graphics");
+        server.app.state.kitty_graphics_enabled = true;
+        let runtime = server
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, pane_id)
+            .expect("pane runtime");
+        runtime.test_process_pty_bytes(
+            b"\x1b_Ga=t,t=d,f=24,i=1,s=1,v=2;////////\x1b\\\x1b_Ga=p,i=1,p=1,c=1,r=1;\x1b\\",
+        );
+        assert!(runtime.has_kitty_graphics_state());
+
+        assert!(!server.topology_preview_safe());
+    }
+
+    #[tokio::test]
+    async fn topology_preview_updates_geometry_before_resizing_pty_then_guarantees_resize() {
+        let initial_screen = vec![b'x'; 160];
+        let (mut server, client_rx, first) = retained_test_server(&initial_screen);
+        let (background_tx, _background_control_rx, background_rx) = test_client_writer();
+        server.clients.insert(
+            2,
+            ClientConnection::new(
+                (100, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                2,
+                RenderEncoding::SemanticFrame,
+                Some(background_tx),
+            ),
+        );
+        let second =
+            server.app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        server.app.state.workspaces[0].insert_test_runtime(
+            second,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b"second"),
+        );
+        server.render_and_stream();
+        let _ = client_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("initial split frame");
+        let _ = background_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("initial background split frame");
+        let first_runtime = server
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, first)
+            .expect("first runtime");
+        let split_size = first_runtime.current_size();
+
+        assert!(server.app.state.workspaces[0].tabs[0]
+            .layout
+            .close_pane(second));
+        server.app.request_topology_frame_first();
+        assert_eq!(
+            server
+                .app
+                .topology_render_phase
+                .next(server.topology_preview_safe()),
+            app::TopologyRenderPlan::PreviewWithoutResize
+        );
+        server.render_and_stream_with_pane_resize(false, false);
+        let _ = client_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("geometry preview frame");
+        let _ = background_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("background geometry preview frame");
+        let preview_size = server
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, first)
+            .expect("first runtime")
+            .current_size();
+        assert_eq!(preview_size, split_size);
+        assert_eq!(server.app.state.view.pane_infos.len(), 1);
+        assert!(server.app.state.view.pane_infos[0].inner_rect.width > split_size.1);
+
+        assert_eq!(
+            server
+                .app
+                .topology_render_phase
+                .next(server.topology_preview_safe()),
+            app::TopologyRenderPlan::ResizeAfterPreview
+        );
+        server.render_and_stream_with_pane_resize(true, true);
+        let _ = client_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("foreground post-resize frame");
+        let _ = background_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("background post-resize frame");
+        let resized = server
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, first)
+            .expect("first runtime")
+            .current_size();
+        assert!(resized.1 > split_size.1);
+
+        let area = Rect::new(0, 0, 100, 24);
+        let (buffer, cursor) = crate::server::render_stream::render_virtual_with_runtime_registry(
+            &mut server.app.state,
+            &server.app.terminal_runtimes,
+            area,
+            false,
+            crate::kitty_graphics::HostCellSize::default(),
+        );
+        let hyperlinks = crate::server::render_stream::visible_hyperlinks(
+            &server.app.state,
+            &server.app.terminal_runtimes,
+        );
+        let expected = FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, cursor, &hyperlinks);
+        let actual = server.clients[&2]
+            .render_state
+            .last_frame()
+            .expect("background final frame");
+        assert_frame_data_eq(actual, &expected);
+    }
+
+    #[tokio::test]
+    async fn rejected_topology_preview_pre_resizes_before_multi_client_fanout() {
+        let initial_screen = vec![b'x'; 160];
+        let (mut server, foreground_rx, first) = retained_test_server(&initial_screen);
+        let (background_tx, _background_control_rx, background_rx) = test_client_writer();
+        server.clients.insert(
+            2,
+            ClientConnection::new(
+                (100, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                2,
+                RenderEncoding::SemanticFrame,
+                Some(background_tx),
+            ),
+        );
+        let second =
+            server.app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        server.app.state.workspaces[0].insert_test_runtime(
+            second,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b"second"),
+        );
+        server.render_and_stream();
+        let _ = foreground_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("initial foreground split frame");
+        let _ = background_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("initial background split frame");
+        let split_size = server
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, first)
+            .expect("first runtime")
+            .current_size();
+
+        assert!(server.app.state.workspaces[0].tabs[0]
+            .layout
+            .close_pane(second));
+        server.app.state.kitty_graphics_enabled = true;
+        server.app.pane_graphics.slots.insert(
+            (first, "primary".into()),
+            crate::app::pane_graphics::Slot::test(1, None),
+        );
+        server.app.request_topology_frame_first();
+        assert!(!server.topology_preview_safe());
+        let plan = server.app.topology_render_phase.next(false);
+        assert_eq!(plan, app::TopologyRenderPlan::ResizeTopology);
+        server.render_and_stream_with_pane_resize(
+            true,
+            matches!(plan, app::TopologyRenderPlan::ResizeTopology),
+        );
+
+        let _ = foreground_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("foreground post-resize frame");
+        let _ = background_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("background post-resize frame");
+        let resized = server
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, first)
+            .expect("first runtime")
+            .current_size();
+        assert!(resized.1 > split_size.1);
+
+        let area = Rect::new(0, 0, 100, 24);
+        let (buffer, cursor) = crate::server::render_stream::render_virtual_with_runtime_registry(
+            &mut server.app.state,
+            &server.app.terminal_runtimes,
+            area,
+            false,
+            crate::kitty_graphics::HostCellSize::default(),
+        );
+        let hyperlinks = crate::server::render_stream::visible_hyperlinks(
+            &server.app.state,
+            &server.app.terminal_runtimes,
+        );
+        let expected = FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, cursor, &hyperlinks);
+        let actual = server.clients[&2]
+            .render_state
+            .last_frame()
+            .expect("background final frame");
+        assert_frame_data_eq(actual, &expected);
     }
 
     #[tokio::test]

@@ -128,6 +128,11 @@ impl App {
             data: EventData::PaneCreated { pane: pane.clone() },
         });
         self.emit_layout_updated_event(ws_idx, target_tab_idx);
+        let visible = self.state.active == Some(ws_idx)
+            && self.state.workspaces[ws_idx].active_tab_index() == target_tab_idx;
+        if visible {
+            self.request_topology_frame_first();
+        }
 
         encode_success(id, ResponseResult::PaneInfo { pane })
     }
@@ -635,6 +640,8 @@ impl App {
         else {
             return encode_error(id, "pane_not_found", "source pane not found");
         };
+        let source_was_visible = self.state.active == Some(source_ws_idx)
+            && self.state.workspaces[source_ws_idx].active_tab_index() == source_tab_idx;
         let previous_pane_id = self
             .public_pane_id(source_ws_idx, source_pane_id)
             .unwrap_or_else(|| pane_id.clone());
@@ -1039,6 +1046,12 @@ impl App {
             self.emit_layout_updated_snapshot(source_layout);
         }
         self.emit_layout_updated_snapshot((*move_result.target_layout).clone());
+
+        let target_is_visible = self.state.active == Some(target_ws_idx)
+            && self.state.workspaces[target_ws_idx].active_tab_index() == target_tab_idx;
+        if source_was_visible || target_is_visible {
+            self.request_topology_frame_first();
+        }
 
         encode_success(id, ResponseResult::PaneMove { move_result })
     }
@@ -1558,6 +1571,12 @@ impl App {
             return Err(pane_not_found(id, &target.pane_id));
         };
         let workspace_id = self.public_workspace_id(ws_idx);
+        let was_visible = self.state.active == Some(ws_idx)
+            && self.state.workspaces.get(ws_idx).is_some_and(|workspace| {
+                workspace
+                    .find_tab_index_for_pane(pane_id)
+                    .is_some_and(|tab_idx| workspace.active_tab_index() == tab_idx)
+            });
         let layout_update_target = self.layout_update_target_after_pane_removal(ws_idx, pane_id);
         if self.state.close_pane_would_close_workspace(ws_idx, pane_id)
             && self.state.confirm_implicit_worktree_group_close(ws_idx)
@@ -1611,6 +1630,9 @@ impl App {
             }
         }
 
+        if was_visible {
+            self.request_topology_frame_first();
+        }
         Ok(())
     }
 
@@ -2635,6 +2657,81 @@ mod tests {
         assert_eq!(
             app.state.workspaces[0].tabs[0].terminal_id(source),
             Some(&source_terminal)
+        );
+        assert_eq!(
+            app.topology_render_phase,
+            crate::app::TopologyRenderPhase::PreviewPending
+        );
+    }
+
+    #[test]
+    fn api_pane_move_between_background_tabs_does_not_request_topology_preview() {
+        let mut app = app_with_linked_worktree();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        let source_tab = app.state.workspaces[0].test_add_tab(Some("source"));
+        let source = app.state.workspaces[0].tabs[source_tab].root_pane;
+        let target_tab = app.state.workspaces[0].test_add_tab(Some("target"));
+        let target = app.state.workspaces[0].tabs[target_tab].root_pane;
+        seed_terminal_states(&mut app);
+        let source_public = app.public_pane_id(0, source).unwrap();
+        let target_public = app.public_pane_id(0, target).unwrap();
+        let target_tab_public = app.public_tab_id(0, target_tab).unwrap();
+
+        let response = app.handle_pane_move(
+            "req".into(),
+            PaneMoveParams {
+                pane_id: source_public,
+                destination: PaneMoveDestination::Tab {
+                    tab_id: target_tab_public,
+                    target_pane_id: Some(target_public),
+                    split: SplitDirection::Right,
+                    ratio: Some(0.5),
+                },
+                focus: false,
+            },
+        );
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(success.result, ResponseResult::PaneMove { .. }));
+        assert_eq!(
+            app.topology_render_phase,
+            crate::app::TopologyRenderPhase::Idle
+        );
+    }
+
+    #[test]
+    fn api_pane_move_into_visible_target_requests_topology_preview() {
+        let mut app = app_with_linked_worktree();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        let target = app.state.workspaces[0].tabs[0].root_pane;
+        let source_tab = app.state.workspaces[0].test_add_tab(Some("source"));
+        let source = app.state.workspaces[0].tabs[source_tab].root_pane;
+        seed_terminal_states(&mut app);
+        let source_public = app.public_pane_id(0, source).unwrap();
+        let target_public = app.public_pane_id(0, target).unwrap();
+        let target_tab_public = app.public_tab_id(0, 0).unwrap();
+
+        let response = app.handle_pane_move(
+            "req".into(),
+            PaneMoveParams {
+                pane_id: source_public,
+                destination: PaneMoveDestination::Tab {
+                    tab_id: target_tab_public,
+                    target_pane_id: Some(target_public),
+                    split: SplitDirection::Right,
+                    ratio: Some(0.5),
+                },
+                focus: false,
+            },
+        );
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(success.result, ResponseResult::PaneMove { .. }));
+        assert_eq!(
+            app.topology_render_phase,
+            crate::app::TopologyRenderPhase::PreviewPending
         );
     }
 

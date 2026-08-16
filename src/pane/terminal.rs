@@ -518,6 +518,10 @@ impl PaneTerminal {
             .kitty_image_placements_with_data_filter(needs_data)
     }
 
+    pub fn has_kitty_graphics_state(&self) -> bool {
+        self.ghostty.has_kitty_graphics_state()
+    }
+
     pub fn apply_host_terminal_theme(&self, theme: crate::terminal_theme::TerminalTheme) {
         self.ghostty.apply_host_terminal_theme(theme);
     }
@@ -1564,7 +1568,10 @@ impl GhosttyPaneTerminal {
         cell_width_px: u32,
         cell_height_px: u32,
     ) -> Vec<Bytes> {
+        let lock_started = crate::render_prof::timer();
         if let Ok(mut core) = self.core.lock() {
+            let lock_elapsed = lock_started.map(|started| started.elapsed());
+            let preflight_started = crate::render_prof::timer();
             let offset_from_bottom = core
                 .terminal
                 .scrollbar()
@@ -1591,12 +1598,16 @@ impl GhosttyPaneTerminal {
             } else {
                 None
             };
+            let preflight_elapsed = preflight_started.map(|started| started.elapsed());
 
+            let ghostty_started = crate::render_prof::timer();
             let _ = core
                 .terminal
                 .resize(cols, rows, cell_width_px, cell_height_px);
+            let ghostty_elapsed = ghostty_started.map(|started| started.elapsed());
             let terminal_responses = self.drain_pending_pty_responses();
 
+            let recovery_started = crate::render_prof::timer();
             let bottom_is_blank = ghostty_detection_text(&mut core)
                 .map(|text| text.trim().is_empty())
                 .unwrap_or(false);
@@ -1624,8 +1635,22 @@ impl GhosttyPaneTerminal {
                     remaining -= 1;
                 }
             }
+            let recovery_elapsed = recovery_started.map(|started| started.elapsed());
+            drop(core);
+
+            for (name, elapsed) in [
+                ("terminal_resize.lock_wait", lock_elapsed),
+                ("terminal_resize.preflight", preflight_elapsed),
+                ("terminal_resize.ghostty", ghostty_elapsed),
+                ("terminal_resize.recovery", recovery_elapsed),
+            ] {
+                if let Some(elapsed) = elapsed {
+                    crate::render_prof::duration(name, elapsed);
+                }
+            }
             terminal_responses
         } else {
+            crate::render_prof::duration_since("terminal_resize.lock_wait", lock_started);
             Vec::new()
         }
     }
@@ -2109,6 +2134,14 @@ impl GhosttyPaneTerminal {
                     .ok()
             })
             .unwrap_or_default()
+    }
+
+    pub fn has_kitty_graphics_state(&self) -> bool {
+        self.core
+            .lock()
+            .ok()
+            .and_then(|core| core.terminal.kitty_graphics_generation().ok())
+            .is_some_and(|generation| generation != 0)
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect, show_cursor: bool) {
