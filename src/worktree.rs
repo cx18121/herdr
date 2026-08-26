@@ -160,6 +160,25 @@ pub(crate) fn build_worktree_remove_command(
     path: &Path,
     force: bool,
 ) -> WorktreeCommand {
+    if repo_root.join(".config/wt.toml").is_file() {
+        let mut args = vec![
+            "-C".to_string(),
+            repo_root.display().to_string(),
+            "remove".to_string(),
+            "--foreground".to_string(),
+            "--no-delete-branch".to_string(),
+        ];
+        if force {
+            args.push("--force".to_string());
+        }
+        args.push(path.display().to_string());
+
+        return WorktreeCommand {
+            program: "wt".to_string(),
+            args,
+        };
+    }
+
     let mut args = vec![
         "-C".to_string(),
         repo_root.display().to_string(),
@@ -179,8 +198,9 @@ pub(crate) fn build_worktree_remove_command(
 
 pub(crate) fn is_dirty_worktree_remove_error(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
-    lower.contains("contains modified or untracked files")
-        && lower.contains("use --force to delete it")
+    (lower.contains("contains modified or untracked files")
+        && lower.contains("use --force to delete it"))
+        || (lower.contains("has uncommitted changes") && lower.contains("wt remove --force"))
 }
 
 pub(crate) fn is_not_working_tree_remove_error(message: &str) -> bool {
@@ -778,9 +798,38 @@ prunable stale
     }
 
     #[test]
-    fn dirty_remove_error_detection_matches_git_force_hint() {
+    fn worktree_remove_command_uses_worktrunk_when_project_config_exists() {
+        let repo = unique_temp_path("worktree-remove-command-repo");
+        std::fs::create_dir_all(repo.join(".config")).unwrap();
+        std::fs::write(repo.join(".config/wt.toml"), "[pre-remove]\n").unwrap();
+        let checkout = repo.with_extension("issue-137");
+
+        let command = build_worktree_remove_command(&repo, &checkout, true);
+
+        assert_eq!(command.program, "wt");
+        assert_eq!(
+            command.args,
+            vec![
+                "-C",
+                repo.to_str().unwrap(),
+                "remove",
+                "--foreground",
+                "--no-delete-branch",
+                "--force",
+                checkout.to_str().unwrap()
+            ]
+        );
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn dirty_remove_error_detection_matches_git_and_worktrunk_force_hints() {
         assert!(is_dirty_worktree_remove_error(
             "fatal: '/w/herdr' contains modified or untracked files, use --force to delete it"
+        ));
+        assert!(is_dirty_worktree_remove_error(
+            "Cannot remove worktree: issue-137 has uncommitted changes\n\
+             Commit or stash changes first, or to lose uncommitted changes, run wt remove --force issue-137"
         ));
         assert!(!is_dirty_worktree_remove_error(
             "fatal: '/w/herdr' is a missing but already registered worktree"
