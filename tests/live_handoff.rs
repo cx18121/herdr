@@ -302,6 +302,35 @@ fn wait_for_api(socket_path: &Path, timeout: Duration) {
     );
 }
 
+fn wait_for_pane_shell_ready(socket_path: &Path, pane_id: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    let mut last_response = serde_json::Value::Null;
+    while Instant::now() < deadline {
+        let response = request(
+            socket_path,
+            serde_json::json!({
+                "id": "test:pane:wait-for-shell",
+                "method": "pane.process_info",
+                "params": {"pane_id": pane_id}
+            }),
+        );
+        let process_info = &response["result"]["process_info"];
+        let shell_pid = process_info["shell_pid"].as_u64();
+        let foreground_processes = process_info["foreground_processes"].as_array();
+        if shell_pid.is_some()
+            && process_info["foreground_process_group_id"].as_u64() == shell_pid
+            && foreground_processes.is_some_and(|processes| {
+                processes.len() == 1 && processes[0]["pid"].as_u64() == shell_pid
+            })
+        {
+            return;
+        }
+        last_response = response;
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!("pane shell did not become ready: {last_response}");
+}
+
 fn write_plugin_manifest(root: &Path, plugin_id: &str) {
     fs::create_dir_all(root).unwrap();
     fs::write(
@@ -1229,7 +1258,7 @@ fn live_handoff_keeps_unmanaged_agent_name_bound_to_saved_session() {
     fs::write(
         &fake_pi,
         format!(
-            "#!/bin/sh\nexport HERDR_AGENT=pi\necho started > {}\nexec /bin/sleep 30\n",
+            "#!/bin/sh\necho started > {}\nwhile :; do /bin/sleep 1; done\n",
             started_marker.display()
         ),
     )
@@ -1251,6 +1280,7 @@ fn live_handoff_keeps_unmanaged_agent_name_bound_to_saved_session() {
         .as_str()
         .unwrap()
         .to_string();
+    wait_for_pane_shell_ready(&api_socket, &pane_id, Duration::from_secs(5));
     assert_ok(request(
         &api_socket,
         serde_json::json!({
@@ -1303,10 +1333,35 @@ fn live_handoff_keeps_unmanaged_agent_name_bound_to_saved_session() {
         if response.get("result").is_some() {
             break;
         }
-        assert!(
-            Instant::now() < deadline,
-            "agent process was not detected: {response}"
-        );
+        if Instant::now() >= deadline {
+            let process_info = request(
+                &api_socket,
+                serde_json::json!({
+                    "id": "test:agent:process-info",
+                    "method": "pane.process_info",
+                    "params": {"pane_id": pane_id}
+                }),
+            );
+            let agents = request(
+                &api_socket,
+                serde_json::json!({
+                    "id": "test:agent:list",
+                    "method": "agent.list",
+                    "params": {}
+                }),
+            );
+            let pane = request(
+                &api_socket,
+                serde_json::json!({
+                    "id": "test:agent:pane-read",
+                    "method": "pane.read",
+                    "params": {"pane_id": pane_id, "source": "recent", "format": "text", "lines": 40}
+                }),
+            );
+            panic!(
+                "agent process was not detected: {response}; process info: {process_info}; agents: {agents}; pane: {pane}"
+            );
+        }
         thread::sleep(Duration::from_millis(25));
     }
     assert_ok(request(
@@ -1415,6 +1470,7 @@ fn live_handoff_keeps_agent_started_pane_after_agent_exits() {
         .as_str()
         .unwrap()
         .to_string();
+    wait_for_pane_shell_ready(&api_socket, &pane_id, Duration::from_secs(5));
 
     let started = request(
         &api_socket,
