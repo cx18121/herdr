@@ -296,7 +296,7 @@ impl App {
             return;
         }
 
-        if Self::should_shutdown_workspace_terminal_runtimes_for_worktree_remove(params.force) {
+        if Self::should_shutdown_workspace_terminal_runtimes_for_worktree_remove() {
             self.shutdown_workspace_terminal_runtimes_for_worktree_remove(ws_idx);
         }
 

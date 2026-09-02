@@ -164,6 +164,7 @@ pub(crate) fn build_worktree_remove_command(
         let mut args = vec![
             "-C".to_string(),
             repo_root.display().to_string(),
+            "--yes".to_string(),
             "remove".to_string(),
             "--foreground".to_string(),
             "--no-delete-branch".to_string(),
@@ -812,6 +813,7 @@ prunable stale
             vec![
                 "-C",
                 repo.to_str().unwrap(),
+                "--yes",
                 "remove",
                 "--foreground",
                 "--no-delete-branch",

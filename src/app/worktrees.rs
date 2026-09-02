@@ -731,7 +731,7 @@ impl App {
             return;
         };
 
-        if Self::should_shutdown_workspace_terminal_runtimes_for_worktree_remove(force) {
+        if Self::should_shutdown_workspace_terminal_runtimes_for_worktree_remove() {
             if let Some(ws_idx) = self
                 .state
                 .workspaces
@@ -1036,10 +1036,10 @@ impl App {
         }
     }
 
-    pub(crate) fn should_shutdown_workspace_terminal_runtimes_for_worktree_remove(
-        force: bool,
-    ) -> bool {
-        force || cfg!(windows)
+    pub(crate) fn should_shutdown_workspace_terminal_runtimes_for_worktree_remove() -> bool {
+        // Unix can unlink an active process's working directory. Keeping the runtime alive
+        // preserves the workspace and its removal error when a pre-remove hook fails.
+        cfg!(windows)
     }
 
     pub(crate) fn close_removed_linked_worktree_workspace(&mut self, ws_idx: usize) {
@@ -2656,11 +2656,10 @@ mod tests {
     }
 
     #[test]
-    fn worktree_remove_runtime_shutdown_policy_preserves_windows_safe_remove() {
+    fn worktree_remove_runtime_shutdown_policy_is_windows_only() {
         assert_eq!(
-            App::should_shutdown_workspace_terminal_runtimes_for_worktree_remove(false),
+            App::should_shutdown_workspace_terminal_runtimes_for_worktree_remove(),
             cfg!(windows)
         );
-        assert!(App::should_shutdown_workspace_terminal_runtimes_for_worktree_remove(true));
     }
 }
