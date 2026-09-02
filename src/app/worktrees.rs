@@ -10,6 +10,13 @@ use super::{
 use crate::events::AppEvent;
 use crate::events::{WorktreeAddResult, WorktreeRemoveResult};
 
+const WORKTREE_REMOVE_IN_PROGRESS_DIAGNOSTIC: &str =
+    "A worktree checkout is already being removed.";
+const WORKTREE_REMOVE_REQUIRES_FORCE_DIAGNOSTIC: &str =
+    "Worktree checkout has modified or untracked files. Choose Delete worktree checkout again to review.";
+const WORKTREE_REMOVE_FAILED_DIAGNOSTIC: &str =
+    "Worktree checkout removal failed. Choose Delete worktree checkout again for details.";
+
 impl App {
     fn worktree_source_metadata(
         &self,
@@ -125,6 +132,16 @@ impl App {
     }
 
     pub(crate) fn open_remove_linked_worktree_confirmation(&mut self, ws_idx: usize) {
+        if self
+            .state
+            .worktree_remove
+            .as_ref()
+            .is_some_and(|remove| remove.removing)
+        {
+            self.state.config_diagnostic = Some(WORKTREE_REMOVE_IN_PROGRESS_DIAGNOSTIC.into());
+            return;
+        }
+
         let Some(ws) = self.state.workspaces.get(ws_idx) else {
             return;
         };
@@ -139,9 +156,17 @@ impl App {
         let Some(space) = ws.worktree_space().cloned() else {
             return;
         };
+        let workspace_id = ws.id.clone();
         self.state.selected = ws_idx;
+        self.clear_worktree_remove_diagnostic();
+        if self.state.worktree_remove.as_ref().is_some_and(|remove| {
+            remove.workspace_id == workspace_id && remove.path == space.checkout_path
+        }) {
+            self.state.mode = Mode::ConfirmRemoveWorktree;
+            return;
+        }
         self.state.worktree_remove = Some(WorktreeRemoveState {
-            workspace_id: ws.id.clone(),
+            workspace_id,
             repo_root: space.repo_root,
             path: space.checkout_path,
             error: None,
@@ -149,6 +174,52 @@ impl App {
             force_confirmation: false,
         });
         self.state.mode = Mode::ConfirmRemoveWorktree;
+    }
+
+    pub(crate) fn set_worktree_remove_failure_diagnostic(&mut self, requires_force: bool) {
+        self.state.config_diagnostic = Some(
+            if requires_force {
+                WORKTREE_REMOVE_REQUIRES_FORCE_DIAGNOSTIC
+            } else {
+                WORKTREE_REMOVE_FAILED_DIAGNOSTIC
+            }
+            .into(),
+        );
+    }
+
+    fn clear_worktree_remove_diagnostic(&mut self) {
+        let is_remove_diagnostic = self
+            .state
+            .config_diagnostic
+            .as_deref()
+            .is_some_and(|message| {
+                matches!(
+                    message,
+                    WORKTREE_REMOVE_IN_PROGRESS_DIAGNOSTIC
+                        | WORKTREE_REMOVE_REQUIRES_FORCE_DIAGNOSTIC
+                        | WORKTREE_REMOVE_FAILED_DIAGNOSTIC
+                )
+            });
+        if is_remove_diagnostic {
+            self.state.config_diagnostic = None;
+        }
+    }
+
+    pub(crate) fn clear_completed_worktree_remove(&mut self) {
+        self.state.worktree_remove = None;
+        self.clear_worktree_remove_diagnostic();
+    }
+
+    pub(crate) fn normalize_mode_after_worktree_remove(&mut self) {
+        if (self.state.mode == Mode::ConfirmRemoveWorktree && self.state.worktree_remove.is_none())
+            || (self.state.mode == Mode::Terminal && self.state.active.is_none())
+        {
+            self.state.mode = if self.state.active.is_some() {
+                Mode::Terminal
+            } else {
+                Mode::Navigate
+            };
+        }
     }
 
     pub(crate) fn open_existing_worktree_dialog(&mut self, ws_idx: usize) {
@@ -774,7 +845,14 @@ impl App {
                 remove.removing = false;
                 remove.error = Some(message);
             }
+            return;
         }
+
+        self.state.mode = if self.state.active.is_some() {
+            Mode::Terminal
+        } else {
+            Mode::Navigate
+        };
     }
 
     pub(crate) fn handle_worktree_add_finished(&mut self, result: WorktreeAddResult) {
@@ -891,7 +969,6 @@ impl App {
             Ok(()) => {
                 tracing::info!(workspace_id = %result.workspace_id, path = %result.path.display(), "git worktree remove completed");
                 let forced = result.forced;
-                self.state.worktree_remove = None;
                 let mut workspace_id = result.workspace_id.clone();
                 let mut workspace_snapshot = result.workspace.as_deref().cloned();
                 let mut worktree = result.worktree.as_deref().cloned();
@@ -936,25 +1013,23 @@ impl App {
                         forced,
                     );
                 }
-                self.state.mode = if self.state.active.is_some() {
-                    Mode::Terminal
-                } else {
-                    Mode::Navigate
-                };
+                self.clear_completed_worktree_remove();
+                self.normalize_mode_after_worktree_remove();
                 self.render_dirty.request_generic();
                 self.render_notify.notify_one();
             }
             Err(message) => {
                 tracing::warn!(workspace_id = %result.workspace_id, path = %result.path.display(), error = %message, "git worktree remove failed");
                 remove.removing = false;
-                if !remove.force_confirmation
-                    && crate::worktree::is_dirty_worktree_remove_error(&message)
-                {
+                let requires_force = !remove.force_confirmation
+                    && crate::worktree::is_dirty_worktree_remove_error(&message);
+                if requires_force {
                     remove.force_confirmation = true;
                     remove.error = None;
                 } else {
                     remove.error = Some(message);
                 }
+                self.set_worktree_remove_failure_diagnostic(requires_force);
                 self.render_dirty.request_generic();
                 self.render_notify.notify_one();
             }
@@ -2102,6 +2177,201 @@ mod tests {
             crate::worktree::build_worktree_remove_command(&repo, &source_checkout, false);
         crate::worktree::run_worktree_command(&remove_source).unwrap();
         let _ = std::fs::remove_dir_all(worktree_root);
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn completed_remove_without_an_active_workspace_returns_to_navigate_mode() {
+        let mut app = app_for_worktree_tests();
+        app.state.mode = Mode::Terminal;
+        app.state.active = None;
+        app.state.worktree_remove = Some(WorktreeRemoveState {
+            workspace_id: "removed".into(),
+            repo_root: "/repo/herdr".into(),
+            path: "/repo/herdr-removed".into(),
+            error: None,
+            removing: true,
+            force_confirmation: false,
+        });
+
+        app.clear_completed_worktree_remove();
+        app.normalize_mode_after_worktree_remove();
+
+        assert_eq!(app.state.mode, Mode::Navigate);
+        assert!(app.state.worktree_remove.is_none());
+    }
+
+    #[test]
+    fn external_remove_completion_preserves_an_unrelated_confirmation() {
+        let mut app = app_for_worktree_tests();
+        app.state.mode = Mode::ConfirmRemoveWorktree;
+        app.state.worktree_remove = Some(WorktreeRemoveState {
+            workspace_id: "still-reviewing".into(),
+            repo_root: "/repo/herdr".into(),
+            path: "/repo/herdr-still-reviewing".into(),
+            error: None,
+            removing: false,
+            force_confirmation: false,
+        });
+
+        app.normalize_mode_after_worktree_remove();
+
+        assert_eq!(app.state.mode, Mode::ConfirmRemoveWorktree);
+        assert!(app.state.worktree_remove.is_some());
+    }
+
+    #[test]
+    fn in_flight_worktree_remove_is_not_replaced_by_another_confirmation() {
+        let mut app = app_for_worktree_tests();
+        let first_path = std::path::PathBuf::from("/repo/herdr-first");
+        app.state.worktree_remove = Some(WorktreeRemoveState {
+            workspace_id: "first".into(),
+            repo_root: "/repo/herdr".into(),
+            path: first_path.clone(),
+            error: None,
+            removing: true,
+            force_confirmation: false,
+        });
+        let mut second = crate::workspace::Workspace::test_new("second");
+        second.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "repo-key".into(),
+            label: "herdr".into(),
+            repo_root: "/repo/herdr".into(),
+            checkout_path: "/repo/herdr-second".into(),
+            is_linked_worktree: true,
+        });
+        app.state.workspaces = vec![second];
+
+        app.open_remove_linked_worktree_confirmation(0);
+
+        assert_eq!(
+            app.state
+                .worktree_remove
+                .as_ref()
+                .map(|remove| remove.path.as_path()),
+            Some(first_path.as_path())
+        );
+        assert_eq!(
+            app.state.config_diagnostic.as_deref(),
+            Some(WORKTREE_REMOVE_IN_PROGRESS_DIAGNOSTIC)
+        );
+
+        app.clear_completed_worktree_remove();
+        assert!(app.state.config_diagnostic.is_none());
+    }
+
+    #[test]
+    fn submitted_worktree_remove_releases_modal_without_losing_background_state() {
+        let repo = create_committed_repo("app-worktree-responsive-remove-repo");
+        let checkout = unique_temp_path("app-worktree-responsive-remove-checkout");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "worktree/responsive-remove",
+                checkout.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+
+        let mut app = app_for_worktree_tests();
+        let mut workspace = crate::workspace::Workspace::test_new("issue");
+        workspace.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "repo-key".into(),
+            label: "herdr".into(),
+            repo_root: repo.clone(),
+            checkout_path: checkout.clone(),
+            is_linked_worktree: true,
+        });
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.open_remove_linked_worktree_confirmation(0);
+
+        app.submit_worktree_remove_via_api();
+
+        assert_eq!(app.state.mode, Mode::Terminal);
+        assert!(app
+            .state
+            .worktree_remove
+            .as_ref()
+            .is_some_and(|remove| remove.removing));
+
+        app.state.mode = Mode::GlobalMenu;
+        let event = wait_for_worktree_event(&mut app);
+        app.handle_internal_event(event);
+
+        assert_eq!(app.state.mode, Mode::GlobalMenu);
+        assert!(app.state.worktree_remove.is_none());
+        assert!(!checkout.exists());
+
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn failed_background_worktree_remove_restores_confirmation() {
+        let repo = create_committed_repo("app-worktree-responsive-dirty-repo");
+        let checkout = unique_temp_path("app-worktree-responsive-dirty-checkout");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "worktree/responsive-dirty",
+                checkout.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        std::fs::write(checkout.join("README.md"), "dirty\n").unwrap();
+
+        let mut app = app_for_worktree_tests();
+        let mut workspace = crate::workspace::Workspace::test_new("issue");
+        workspace.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "repo-key".into(),
+            label: "herdr".into(),
+            repo_root: repo.clone(),
+            checkout_path: checkout.clone(),
+            is_linked_worktree: true,
+        });
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.open_remove_linked_worktree_confirmation(0);
+
+        app.submit_worktree_remove_via_api();
+        assert_eq!(app.state.mode, Mode::Terminal);
+
+        app.state.mode = Mode::GlobalMenu;
+        let event = wait_for_worktree_event(&mut app);
+        app.handle_internal_event(event);
+
+        let remove = app.state.worktree_remove.as_ref().unwrap();
+        assert_eq!(app.state.mode, Mode::GlobalMenu);
+        assert!(!remove.removing);
+        assert!(remove.force_confirmation);
+        assert_eq!(
+            app.state.config_diagnostic.as_deref(),
+            Some(WORKTREE_REMOVE_REQUIRES_FORCE_DIAGNOSTIC)
+        );
+        assert!(checkout.exists());
+
+        app.open_remove_linked_worktree_confirmation(0);
+        assert_eq!(app.state.mode, Mode::ConfirmRemoveWorktree);
+        assert!(app.state.config_diagnostic.is_none());
+        assert!(app
+            .state
+            .worktree_remove
+            .as_ref()
+            .is_some_and(|remove| remove.force_confirmation));
+
+        let command = crate::worktree::build_worktree_remove_command(&repo, &checkout, true);
+        crate::worktree::run_worktree_command(&command).unwrap();
         let _ = std::fs::remove_dir_all(repo);
     }
 

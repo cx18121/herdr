@@ -518,6 +518,9 @@ impl App {
                     } else {
                         remove.error = Some(message.clone());
                     }
+                    self.set_worktree_remove_failure_diagnostic(
+                        code == "dirty_worktree_requires_force",
+                    );
                 }
             }
             Self::send_api_response(api.respond_to, encode_error(api.id, code, message));
@@ -584,13 +587,9 @@ impl App {
         if self.state.worktree_remove.as_ref().is_some_and(|remove| {
             remove.workspace_id == result.workspace_id && remove.path == result.path
         }) {
-            self.state.worktree_remove = None;
-            self.state.mode = if self.state.active.is_some() {
-                crate::app::Mode::Terminal
-            } else {
-                crate::app::Mode::Navigate
-            };
+            self.clear_completed_worktree_remove();
         }
+        self.normalize_mode_after_worktree_remove();
         let response = encode_success(
             api.id,
             ResponseResult::WorktreeRemoved {

@@ -1830,6 +1830,7 @@ mod tests {
         app.state.ensure_test_terminals();
         app.state.active = Some(0);
         app.state.selected = 0;
+        app.state.mode = crate::app::Mode::Terminal;
 
         let response = run_deferred_api_request(
             &mut app,
@@ -1847,6 +1848,7 @@ mod tests {
             ResponseResult::WorktreeRemoved { .. }
         ));
         assert!(app.state.workspaces.is_empty());
+        assert_eq!(app.state.mode, crate::app::Mode::Navigate);
         assert!(app.state.terminal_runtime_shutdowns.is_empty());
         assert!(event_hub.events_after(0).iter().any(|(_, event)| {
             matches!(
